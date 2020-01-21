@@ -5,8 +5,31 @@ import sys
 
 class MlabelSimple(nn.Module):
 
+    @classmethod
+    def from_cpoint(cls,f_name):
+        d=torch.load(f_name)
+        bert=transformers.modeling_bert.BertModel.from_pretrained(pretrained_model_name_or_path=None,state_dict=d["classifier_state_dict"],config=d["bert_config"])
+        bert.train()
+        m=cls(bert,d["label_count"])
+        m.classifier.load_state_dict(d["classifier_state_dict"])
+        return m, d
+
+    def cuda(self):
+        self.encoder=self.encoder.cuda()
+        self.classifier=self.classifier.cuda()
+        return self
+    
+    def train(self):
+        self.classifier.train()
+        self.encoder.train()
+
+    def eval(self):
+        self.classifier.eval()
+        self.encoder.eval()
+
     def __init__(self,bert,label_count):
         super().__init__()
+        self.label_count=label_count
         self.encoder=bert
         self.classifier=nn.Linear(self.encoder.config.hidden_size,label_count).cuda()
 
@@ -14,6 +37,16 @@ class MlabelSimple(nn.Module):
         last_hidden,cls=self.encoder(encoder_input)
         return torch.sigmoid(self.classifier(cls))
         #classification_output=self.classifier(bert_encoded
+
+    def save(self,f_name,xtra_dict={}):
+        d={"classifier_state_dict":self.classifier.state_dict(),
+           "bert_state_dict":self.encoder.state_dict(),
+           "bert_config":self.encoder.config,
+           "label_count":self.label_count}
+        for k,v in xtra_dict.items():
+            assert k not in d
+            d[k]=v
+        torch.save(d,f_name)
         
         
 class MlabelDecoder(nn.Module):

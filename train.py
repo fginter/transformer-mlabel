@@ -8,6 +8,7 @@ import alias_multinomial
 import tqdm
 import json
 import torch.optim as optim
+import os
 
 transformers.BERT_PRETRAINED_MODEL_ARCHIVE_MAP["bert-base-finnish-cased-v1"]="http://dl.turkunlp.org/finbert/torch-transformers/bert-base-finnish-cased-v1/pytorch_model.bin"
 transformers.BERT_PRETRAINED_CONFIG_ARCHIVE_MAP["bert-base-finnish-cased-v1"]="http://dl.turkunlp.org/finbert/torch-transformers/bert-base-finnish-cased-v1/config.json"
@@ -45,29 +46,36 @@ def do_train(args):
         batch_out_c=batch_out.cuda()
         batch_neg_c=batch_neg.cuda()
         cls_in=torch.ones_like(batch_out_c)
-        #print(cls_in)
-        #print(batch_neg)
-        #positives
         encoder_output,encoder_attention_mask,decoder_output_pos=model(batch_out_c,encoder_input=batch_in_c)
-        #negatives
+
         _,_,decoder_output_neg=model(batch_neg_c,encoder_output=encoder_output,encoder_attention_mask=encoder_attention_mask)
-        #print("EO",encoder_output.shape)
-        #print("DO",decoder_output[0].shape)
+
         del batch_in_c,batch_out_c,batch_neg_c,encoder_output,decoder_output_pos,decoder_output_neg,encoder_attention_mask
 
 def do_train_simple(args):
     class_stats=json.load(open(args.class_stats_file)) #this is a dict: label -> count
     alias=alias_multinomial.AliasMultinomial.from_class_stats(args.class_stats_file,args.max_labels)
-    
-    encoder_model = transformers.BertModel.from_pretrained("pbert-v1",output_hidden_states=False)
-    if torch.cuda.is_available():
-        encoder_model = encoder_model.cuda()
-    model=tml.MlabelSimple(encoder_model,len(class_stats))
-    optimizer = optim.SGD(model.parameters(), lr=0.0005, momentum=0.9)    
-    
-    for batch_in,batch_out,batch_neg in tqdm.tqdm(data.yield_batched(args.train,6000,max_epochs=1,alias=alias)):
 
-        
+
+    #Do we load from checkpoint?
+    if args.from_cpoint:
+        model,d=tml.MlabelSimple.from_cpoint(args.from_cpoint)
+        model=model.cuda()
+        optimizer = optim.SGD(model.parameters(), lr=0.0005, momentum=0.9)
+        if d.get("optimizer_state_dict"):
+            optimizer.load_state_dict(d["optimizer_state_dict"])
+        it_counter=d.get("it_counter",0)
+    else:
+        #start from fresh
+        os.makedirs(args.store_cpoint,exist_ok=True)
+        encoder_model = transformers.BertModel.from_pretrained("pbert-v1",output_hidden_states=False)
+        encoder_model = encoder_model.cuda()
+        model=tml.MlabelSimple(encoder_model,len(class_stats))
+        model=model.cuda()
+        optimizer = optim.SGD(model.parameters(), lr=0.0005, momentum=0.9)    
+        it_counter=0
+
+    for batch_in,batch_out,batch_neg in tqdm.tqdm(data.yield_batched(args.train,5000,max_epochs=100,alias=alias)):
         batch_in=batch_in.long()[:,:510]
         batch_out=batch_out.long()[:,:510]
         batch_neg=batch_neg.long()[:,:510]
@@ -85,7 +93,15 @@ def do_train_simple(args):
         loss.backward()
         optimizer.step()
         print("loss",loss.item(),flush=True)
+
         del batch_in_c,batch_out_c,batch_neg_c,preds_pos,preds_neg,diff,loss,preds
+        
+        if it_counter%500==0:
+            model.save(os.path.join(args.store_cpoint,"model_{:09}.torch".format(it_counter)),{"optimizer_state_dict":optimizer.state_dict(), "it_counter":it_counter})
+        it_counter+=1
+        
+                       
+        
 
 
 
@@ -97,6 +113,8 @@ if __name__=="__main__":
     parser.add_argument("--gpu",type=int,default=0, help="ID of the GPU to use. Set to -1 for 'I don't care'. Default %(default)d")
     parser.add_argument("--max-labels",type=int,default=1000, help="Max number of most common labels to use. Default %(default)d")
     parser.add_argument("--class-stats-file",help="Class stats file. Default %(default)s")
+    parser.add_argument("--from-cpoint",help="Filename of checkpoint")
+    parser.add_argument("--store-cpoint",help="Directory for checkpoints")
     args=parser.parse_args()
 
     
