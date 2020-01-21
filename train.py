@@ -61,7 +61,7 @@ def do_train_simple(args):
     if args.from_cpoint:
         model,d=tml.MlabelSimple.from_cpoint(args.from_cpoint)
         model=model.cuda()
-        optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+        optimizer = optim.SGD(model.parameters(), lr=args.lrate, momentum=0.9)
         if d.get("optimizer_state_dict"):
             optimizer.load_state_dict(d["optimizer_state_dict"])
         it_counter=d.get("it_counter",0)
@@ -72,7 +72,7 @@ def do_train_simple(args):
         encoder_model = encoder_model.cuda()
         model=tml.MlabelSimple(encoder_model,len(class_stats))
         model=model.cuda()
-        optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)    
+        optimizer = optim.SGD(model.parameters(), lr=args.lrate, momentum=0.9)    
         it_counter=0
 
     for batch_in,batch_out,batch_neg in tqdm.tqdm(data.yield_batched(args.train,args.batch_elements,max_epochs=100,alias=alias)):
@@ -115,7 +115,7 @@ if __name__=="__main__":
     parser.add_argument("--class-stats-file",help="Class stats file. Default %(default)s")
     parser.add_argument("--from-cpoint",help="Filename of checkpoint")
     parser.add_argument("--store-cpoint",help="Directory for checkpoints")
-    parser.add_argument("--lr",type=float,default=1.0,help="Learning rate. Default %(default)f")
+    parser.add_argument("--lrate",type=float,default=1.0,help="Learning rate. Default %(default)f")
     parser.add_argument("--batch-elements",type=int,default=5000,help="How many elements in a batch? (sum of minibatch matrix sizes, not sequence count). Increase if you have more GPU mem. Default %(default)d")
     args=parser.parse_args()
 
