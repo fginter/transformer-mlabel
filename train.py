@@ -52,6 +52,99 @@ def do_train(args):
 
         del batch_in_c,batch_out_c,batch_neg_c,encoder_output,decoder_output_pos,decoder_output_neg,encoder_attention_mask
 
+
+def train_batch(model, data, positives, negatives, optimizer):
+
+    data=data.long()[:,:510]
+    positives=positives.long()[:,:510]
+    negatives=negatives.long()[:,:510]
+    
+    non_zeros_in_batch = (positives!=0.0).sum()
+
+    batch_in_c=data.cuda()
+    batch_out_c=positives.cuda()
+    batch_neg_c=negatives.cuda()
+
+    model.train()
+    torch.set_grad_enabled(True)
+    optimizer.zero_grad()
+    preds=model(batch_in_c)
+    preds_pos=torch.gather(preds,-1,batch_out_c)
+    preds_neg=torch.gather(preds,-1,batch_neg_c)
+    diff=preds_pos-preds_neg
+    loss=-(torch.sum(torch.min(diff,torch.zeros_like(diff)))/non_zeros_in_batch)
+    loss.backward()
+    optimizer.step()
+    loss_value=loss.item()
+    del batch_in_c,batch_out_c,batch_neg_c,preds_pos,preds_neg,diff,loss,preds
+    return loss_value
+    
+    
+def eval_batch(model, data, positives, negatives, optimizer):
+
+    data=data.long()[:,:510]
+    positives=positives.long()[:,:510]
+    negatives=negatives.long()[:,:510]
+    
+    non_zeros_in_batch = (positives!=0.0).sum()
+
+    batch_in_c=data.cuda()
+    batch_out_c=positives.cuda()
+    batch_neg_c=negatives.cuda()
+
+    model.eval()
+    torch.set_grad_enabled(False)
+    optimizer.zero_grad()
+    preds=model(batch_in_c)
+    preds_pos=torch.gather(preds,-1,batch_out_c)
+    preds_neg=torch.gather(preds,-1,batch_neg_c)
+    diff=preds_pos-preds_neg
+    loss=-(torch.sum(torch.min(diff,torch.zeros_like(diff)))/non_zeros_in_batch)
+    
+    loss_value=loss.item()
+    del batch_in_c,batch_out_c,batch_neg_c,preds_pos,preds_neg,diff,loss,preds
+    return loss_value
+    
+    
+def train(args):
+    class_stats=json.load(open(args.class_stats_file)) #this is a dict: label -> count
+    alias=alias_multinomial.AliasMultinomial.from_class_stats(args.class_stats_file,args.max_labels)
+
+
+    #Do we load from checkpoint?
+    if args.from_cpoint:
+        model,d=tml.MlabelSimple.from_cpoint(args.from_cpoint)
+        model=model.cuda()
+        optimizer = optim.SGD(model.parameters(), lr=args.lrate, momentum=0.9)
+        if d.get("optimizer_state_dict"):
+            optimizer.load_state_dict(d["optimizer_state_dict"])
+        it_counter=d.get("it_counter",0)
+    else:
+        #start from fresh
+        os.makedirs(args.store_cpoint,exist_ok=True)
+        encoder_model = transformers.BertModel.from_pretrained("pbert-v1",output_hidden_states=False)
+        encoder_model = encoder_model.cuda()
+        model=tml.MlabelSimple(encoder_model,len(class_stats))
+        model=model.cuda()
+        optimizer = optim.SGD(model.parameters(), lr=args.lrate, momentum=0.9)    
+        it_counter=0
+        
+    dev_iter = data.yield_batched(args.dev,args.batch_elements,max_epochs=1000000000,alias=alias)
+
+    for batch_in,batch_out,batch_neg in tqdm.tqdm(data.yield_batched(args.train,args.batch_elements,max_epochs=100,alias=alias)):
+        
+        train_loss = train_batch(model, batch_in, batch_out, batch_neg, optimizer)
+        
+        dev_data, dev_pos, dev_neg = next(dev_iter)
+        dev_loss = eval_batch(model, dev_data, dev_pos, dev_neg, optimizer)
+        
+        print("Train loss:", train_loss, "Devel loss:", dev_loss)
+        
+        if it_counter%500==0:
+            print("Saving model", it_counter, file=sys.stderr)
+            model.save(os.path.join(args.store_cpoint,"model_{:09}.torch".format(it_counter)),{"optimizer_state_dict":optimizer.state_dict(), "it_counter":it_counter})
+        it_counter+=1
+
 def do_train_simple(args):
     class_stats=json.load(open(args.class_stats_file)) #this is a dict: label -> count
     alias=alias_multinomial.AliasMultinomial.from_class_stats(args.class_stats_file,args.max_labels)
@@ -100,10 +193,66 @@ def do_train_simple(args):
             model.save(os.path.join(args.store_cpoint,"model_{:09}.torch".format(it_counter)),{"optimizer_state_dict":optimizer.state_dict(), "it_counter":it_counter})
         it_counter+=1
         
-                       
+def predict(args):
+    class_stats=json.load(open(args.class_stats_file)) #this is a dict: label -> count
+    alias=alias_multinomial.AliasMultinomial.from_class_stats(args.class_stats_file,args.max_labels)
+
+    idx2label,label2idx,class_stats=data.prep_class_stats(args.class_stats_file, args.max_labels)
+    filtered_labels=set(k for k,v in class_stats.most_common(args.max_labels))
+    
+    #print("labels:",filtered_labels)
+
+
+    #Do we load from checkpoint?
+    if not args.from_cpoint:
+        print("Provide a checkpoint!", file=sys.stderr)
+        sys.exit(0)
+    model,d=tml.MlabelSimple.from_cpoint(args.from_cpoint)
+    model.eval()
+    model=model.cuda()
+    optimizer = optim.SGD(model.parameters(), lr=args.lrate, momentum=0.9) # TODO: do we need this?
+    if d.get("optimizer_state_dict"):
+        optimizer.load_state_dict(d["optimizer_state_dict"])
         
+        
+    it_counter = 0
 
 
+    losses=[]
+    for batch_in,batch_out,batch_neg in tqdm.tqdm(data.yield_batched(args.dev,args.batch_elements,max_epochs=10,alias=alias)):
+        batch_in=batch_in.long()[:,:510]
+        batch_out=batch_out.long()[:,:510]
+        batch_neg=batch_neg.long()[:,:510]
+
+        non_zeros_in_batch = (batch_out!=0.0).sum()
+
+
+        batch_in_c=batch_in.cuda()
+        batch_out_c=batch_out.cuda()
+        batch_neg_c=batch_neg.cuda()
+
+        optimizer.zero_grad()
+        preds=model(batch_in_c)
+ 
+        preds_pos=torch.gather(preds,-1,batch_out_c)
+        preds_neg=torch.gather(preds,-1,batch_neg_c)
+
+        diff=preds_pos-preds_neg
+        #loss=-torch.mean(torch.min(diff,torch.zeros_like(diff)))
+        loss=-(torch.sum(torch.min(diff,torch.zeros_like(diff)))/non_zeros_in_batch)
+        losses.append(loss.item())
+        #loss.backward()
+        #optimizer.step()
+        print("batch",it_counter,"dev loss:", loss.item(),flush=True)
+
+        del batch_in_c,batch_out_c,batch_neg_c,preds_pos,preds_neg,diff,loss,preds
+        
+        it_counter+=1
+
+        if it_counter>=50:
+            break
+            
+    print("DEV LOSS:", (torch.tensor(losses).sum()/torch.tensor(len(losses))).item())
 
 if __name__=="__main__":
     import argparse
@@ -117,12 +266,18 @@ if __name__=="__main__":
     parser.add_argument("--store-cpoint",help="Directory for checkpoints")
     parser.add_argument("--lrate",type=float,default=1.0,help="Learning rate. Default %(default)f")
     parser.add_argument("--batch-elements",type=int,default=5000,help="How many elements in a batch? (sum of minibatch matrix sizes, not sequence count). Increase if you have more GPU mem. Default %(default)d")
+    parser.add_argument("--predict", action="store_true", default=False, help="Run Prediction")
     args=parser.parse_args()
 
     
     
     with torch.cuda.device(args.gpu):
-        do_train_simple(args)
+    
+        if args.predict:
+            print("Running prediction...", file=sys.stderr)
+            predict(args)
+        else:
+            train(args)
 
     
 
