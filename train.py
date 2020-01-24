@@ -110,7 +110,7 @@ def train(args):
     class_stats=json.load(open(args.class_stats_file)) #this is a dict: label -> count
     alias=alias_multinomial.AliasMultinomial.from_class_stats(args.class_stats_file,args.max_labels)
 
-
+    os.makedirs(args.store_cpoint,exist_ok=True)
     #Do we load from checkpoint?
     if args.from_cpoint:
         model,d=tml.MlabelSimple.from_cpoint(args.from_cpoint)
@@ -134,14 +134,15 @@ def train(args):
     for batch_in,batch_out,batch_neg in tqdm.tqdm(data.yield_batched(args.train,args.batch_elements,max_epochs=100,alias=alias)):
         
         train_loss = train_batch(model, batch_in, batch_out, batch_neg, optimizer)
+        print("IT",it_counter,"TRAIN_LOSS", train_loss, flush=True)
+
+        if it_counter%50==0:
+            dev_data, dev_pos, dev_neg = next(dev_iter)
+            dev_loss = eval_batch(model, dev_data, dev_pos, dev_neg, optimizer)
+            print("DEV_LOSS",dev_loss,flush=True)
         
-        dev_data, dev_pos, dev_neg = next(dev_iter)
-        dev_loss = eval_batch(model, dev_data, dev_pos, dev_neg, optimizer)
-        
-        print("Train loss:", train_loss, "Devel loss:", dev_loss)
-        
-        if it_counter%500==0:
-            print("Saving model", it_counter, file=sys.stderr)
+        if it_counter%10000==0:
+            print("Saving model", it_counter, file=sys.stderr,flush=True)
             model.save(os.path.join(args.store_cpoint,"model_{:09}.torch".format(it_counter)),{"optimizer_state_dict":optimizer.state_dict(), "it_counter":it_counter})
         it_counter+=1
 
@@ -219,7 +220,7 @@ def predict(args):
 
 
     losses=[]
-    for batch_in,batch_out,batch_neg in tqdm.tqdm(data.yield_batched(args.dev,args.batch_elements,max_epochs=10,alias=alias)):
+    for batch_in,batch_out,batch_neg in tqdm.tqdm(data.yield_batched(args.dev,args.batch_elements,max_epochs=10,alias=alias,shuffle=False)):
         batch_in=batch_in.long()[:,:510]
         batch_out=batch_out.long()[:,:510]
         batch_neg=batch_neg.long()[:,:510]
@@ -269,8 +270,6 @@ if __name__=="__main__":
     parser.add_argument("--predict", action="store_true", default=False, help="Run Prediction")
     args=parser.parse_args()
 
-    
-    
     with torch.cuda.device(args.gpu):
     
         if args.predict:
