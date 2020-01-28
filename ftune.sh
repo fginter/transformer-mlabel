@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #SBATCH --ntasks=1
-#SBATCH --time=70:15:00
+#SBATCH --time=24:00:00
 #SBATCH --partition=gpu
 #SBATCH --account=project_2002029
 #SBATCH --mem=14G
@@ -16,4 +16,4 @@ module load pytorch/1.3.0
 PROJDIR=$HOME/proj_deepsequence/scratch/ginter/cafa
 source $PROJDIR/venv-torch/bin/activate
 export PYTHONPATH=../venv-torch/lib64/python3.7/site-packages:$PYTHONPATH
-python3 train.py --train CAFA4-ctrl/train.torchbin --dev CAFA4-ctrl/devel.torchbin --max-labels 5000 --class-stats-file CAFA4-ctrl/class-stats.json --store-cpoint checkpoint-CAFA4-ctrl.$LR --lrate $LR
+python3 train.py --train CAFA4-ctrl/train.torchbin --dev CAFA4-ctrl/devel.torchbin --max-labels 5000 --class-stats-file CAFA4-ctrl/class-stats.json --store-cpoint flatdist-margin-checkpoint-CAFA4-ctrl.$LR --lrate $LR
