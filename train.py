@@ -253,7 +253,7 @@ def predict(args):
     losses=[]
     predicted_labels=[]
     # prediction_values=[] # TODO return also these
-    for batch_in, batch_out, batch_neg in tqdm.tqdm(data.yield_batched(args.dev,args.batch_elements, max_epochs=1, alias=alias, shuffle=False)):
+    for batch_in, batch_out, batch_neg in tqdm.tqdm(data.yield_batched(args.dev,args.batch_elements, max_epochs=1, shuffle=False, all_class_indices=set(label_indices))):
     
         loss, labels = train_batch(model, batch_in, batch_out, batch_neg, optimizer, evaluate=True)
         losses.append(loss)
@@ -267,7 +267,7 @@ def predict(args):
     print("DEV LOSS:", (torch.tensor(losses).sum()/torch.tensor(len(losses))).item())
     
     # read gold labels
-    gold_labels = read_gold_labels(args.dev)
+    gold_labels = read_gold_labels(args.dev.split(".", 1)[0]+".txt.gz")
     for t in [1, 10, 25, 50, 100, 200, 300, 400, 500, 0]:
     #for t in [1, 10]:
         print("threshold =", t)
