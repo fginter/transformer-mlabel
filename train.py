@@ -200,8 +200,9 @@ def predict(args):
 
     idx2label,label2idx,class_stats=data.prep_class_stats(args.class_stats_file, args.max_labels)
     filtered_labels=set(k for k,v in class_stats.most_common(args.max_labels))
+    label_indices = torch.tensor([ label2idx[l] for l in filtered_labels ]).cuda() # TODO zero class!
     
-    #print("labels:",filtered_labels)
+    print("filtered labels:", type(label_indices), label_indices.size())
 
 
     #Do we load from checkpoint?
@@ -214,18 +215,23 @@ def predict(args):
     optimizer = optim.SGD(model.parameters(), lr=args.lrate, momentum=0.9) # TODO: do we need this?
     if d.get("optimizer_state_dict"):
         optimizer.load_state_dict(d["optimizer_state_dict"])
-        
+    torch.set_grad_enabled(False)
+                
         
     it_counter = 0
 
 
     losses=[]
-    for batch_in,batch_out,batch_neg in tqdm.tqdm(data.yield_batched(args.dev,args.batch_elements,max_epochs=10,alias=alias,shuffle=False)):
+    predicted_labels=[]
+    prediction_values=[]
+    for batch_in,batch_out,batch_neg in tqdm.tqdm(data.yield_batched(args.dev,args.batch_elements,max_epochs=1,alias=alias,shuffle=False)):
         batch_in=batch_in.long()[:,:510]
         batch_out=batch_out.long()[:,:510]
         batch_neg=batch_neg.long()[:,:510]
 
         non_zeros_in_batch = (batch_out!=0.0).sum()
+        
+        batch_mask = torch.zeros(batch_in.size()[0], len(idx2label))
 
 
         batch_in_c=batch_in.cuda()
@@ -234,6 +240,21 @@ def predict(args):
 
         optimizer.zero_grad()
         preds=model(batch_in_c)
+        
+        repeated = label_indices.repeat(preds.size()[0], 1)
+        
+        preds_filtered = torch.gather(preds, -1, repeated) # pick only labels used in training
+        
+        sorted_indices = torch.argsort(preds_filtered, descending=True)
+        
+        pred_values_sorted = torch.gather(preds_filtered, -1, sorted_indices) # prediction values sorted
+        classes_sorted = torch.gather(repeated, -1, sorted_indices) # class numbers sorted
+
+        for c_row, c_value in zip(classes_sorted, pred_values_sorted):
+            predicted_labels.append(c_row.tolist())
+            prediction_values.append(c_value.tolist())
+        
+        
  
         preds_pos=torch.gather(preds,-1,batch_out_c)
         preds_neg=torch.gather(preds,-1,batch_neg_c)
@@ -244,17 +265,79 @@ def predict(args):
         losses.append(loss.item())
         #loss.backward()
         #optimizer.step()
-        print("batch",it_counter,"dev loss:", loss.item(),flush=True)
+        #print("batch",it_counter,"dev loss:", loss.item(),flush=True)
 
-        del batch_in_c,batch_out_c,batch_neg_c,preds_pos,preds_neg,diff,loss,preds
+        del batch_in_c, batch_out_c, batch_neg_c, preds_pos, preds_neg, diff, loss, preds, repeated, pred_values_sorted, classes_sorted, sorted_indices, preds_filtered
         
         it_counter+=1
 
-        if it_counter>=50:
+        if it_counter>=100:
             break
+        if len(predicted_labels)%1000==0:
+            print("Number of examples:", len(predicted_labels))
+        
+    # read gold labels
+    gold_labels = []
+    import gzip
+    with gzip.open("data/devel.txt.gz", "rt", encoding="utf-8") as f:
+        for line in f:
+            gold_labels.append([])
+            line=line.strip()
+            classes, _ = line.split("\t", 1)
+            for c in classes.split(","):
+                gold_labels[-1].append(c)
             
     print("DEV LOSS:", (torch.tensor(losses).sum()/torch.tensor(len(losses))).item())
+    
+    for t in [1, 10, 25, 50, 100, 200, 300, 400, 500, 0]:
+    #for t in [1, 10]:
+        print("threshold =", t)
+        calculate_fscore(gold_labels, predicted_labels, idx2label, threshold=t)
+        print()
+        
+        
+    # print top labels for first five example
+    
+    #for i,labels in enumerate(predicted_labels[:5]):
+    #    for l in labels[:20]:
+    #        per = round((class_stats[idx2label[l]]/sum(class_stats.values()))*100, 4)
+    #        print("example",i, "label",idx2label[l],per,"%")
+    #    print("---------")
+        
+    #for i,labels in enumerate(gold_labels[:5]):
+    #    for l in labels[:20]:
+    #        per = round((class_stats[l]/sum(class_stats.values()))*100, 4)
+    #        print("gold example",i, "label",l,per,"%")
+    #    print("---------")
 
+
+
+def calculate_fscore(gold, pred, index2label, threshold=0):
+
+    from sklearn.metrics import f1_score, precision_recall_fscore_support
+    from sklearn.preprocessing import MultiLabelBinarizer
+    
+
+    pred_labels = []
+    for example in pred:
+        if threshold!=0:
+            example = example[:min(threshold,len(example))]
+        example_ = []
+        for l in example:
+            example_.append(index2label[l])
+        pred_labels.append(example_)
+    
+    
+    all_labels = list(set([l for row in gold for l in row]) | set([l for row in pred_labels for l in row]))
+    binarizer = MultiLabelBinarizer()
+    binarizer.fit([all_labels])
+    
+    gold_ = binarizer.transform(gold[:len(pred_labels)])
+    pred_ = binarizer.transform(pred_labels)
+    
+    print("F-score:",precision_recall_fscore_support(gold_, pred_, average="micro"))
+
+    
 if __name__=="__main__":
     import argparse
     parser = argparse.ArgumentParser()
