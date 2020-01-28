@@ -53,8 +53,37 @@ def do_train(args):
         del batch_in_c,batch_out_c,batch_neg_c,encoder_output,decoder_output_pos,decoder_output_neg,encoder_attention_mask
 
 
-def train_batch(model, data, positives, negatives, optimizer,loss_margin=0.3):
-    torch.set_grad_enabled(True)
+
+def get_predictions(preds, all_labels):
+
+    predicted_labels=[]
+    prediction_values=[]
+    
+    all_labels = torch.tensor(list(all_labels)).cuda()
+    
+    repeated = all_labels.repeat(preds.size()[0], 1)
+        
+    preds_filtered = torch.gather(preds, -1, repeated) # pick only labels used in training
+        
+    sorted_indices = torch.argsort(preds_filtered, descending=True)
+        
+    pred_values_sorted = torch.gather(preds_filtered, -1, sorted_indices) # prediction values sorted
+    classes_sorted = torch.gather(repeated, -1, sorted_indices) # class numbers sorted
+
+    for c_row, c_value in zip(classes_sorted, pred_values_sorted):
+        predicted_labels.append(c_row.tolist())
+        prediction_values.append(c_value.tolist())
+        
+    return predicted_labels, prediction_values
+
+
+def train_batch(model, data, positives, negatives, optimizer, loss_margin=0.3, evaluate=False):
+    if evaluate:
+        model.eval()
+        torch.set_grad_enabled(False)
+    #else:
+    #    model.train()
+    #    torch.set_grad_enabled(True) # should be okay to remove this line...
     data=data.long()[:,:510]
     positives=positives.long()
     negatives=negatives.long()
@@ -69,43 +98,51 @@ def train_batch(model, data, positives, negatives, optimizer,loss_margin=0.3):
     preds_pos=torch.gather(preds,-1,batch_out_c)
     preds_neg=torch.gather(preds,-1,batch_neg_c)
 
-    diff=pred_pos.unsqueeze(-1).repeat(1,1,preds_neg.shape[1])-preds_neg.unsqueeze(1)-loss_margin
+    diff=preds_pos.unsqueeze(-1).repeat(1,1,preds_neg.shape[1])-preds_neg.unsqueeze(1)-loss_margin
     X_mask=(batch_out_c!=0).float().unsqueeze(-1).repeat(1,1,preds_neg.shape[1])
     Y_mask=(batch_neg_c!=0).float().unsqueeze(1).repeat(1,preds_pos.shape[1],1)
     #diff=preds_pos-preds_neg-torch.full_like(preds_pos,loss_margin)
     mask=X_mask*Y_mask
     loss=-(torch.sum(torch.min(diff*X_mask*Y_mask,torch.zeros_like(diff)))/mask.sum())
-    loss.backward()
-    optimizer.step()
+    if evaluate:
+        # calculate fscore
+        all_labels = set(positives[0].tolist()) | set(negatives[0].tolist()) - set([0])
+        predicted_labels, prediction_values = get_predictions(preds, all_labels)
+        model.train()
+        torch.set_grad_enabled(True) # pre-set this for the next loop
+    else:
+        loss.backward()
+        optimizer.step()
+        predicted_labels=None
     loss_value=loss.item()
-    return loss_value
+    return loss_value, predicted_labels
     
     
-def eval_batch(model, data, positives, negatives, optimizer,loss_margin=0.3):
-    torch.set_grad_enabled(False)
+#def eval_batch(model, data, positives, negatives, optimizer,loss_margin=0.3):
+#    torch.set_grad_enabled(False)
 
-    data=data.long()[:,:510]
-    positives=positives.long()[:,:510]
-    negatives=negatives.long()[:,:510]
+#    data=data.long()[:,:510]
+#    positives=positives.long()[:,:510]
+#    negatives=negatives.long()[:,:510]
     
-    batch_in_c=data.cuda()
-    batch_out_c=positives.cuda()
-    batch_neg_c=negatives.cuda()
-    mask=(batch_out_c!=0).type(torch.float)
-    non_zeros_in_batch = (mask).sum()
+#    batch_in_c=data.cuda()
+#    batch_out_c=positives.cuda()
+#    batch_neg_c=negatives.cuda()
+#    mask=(batch_out_c!=0).type(torch.float)
+#    non_zeros_in_batch = (mask).sum()
 
 
 
-    optimizer.zero_grad()
-    preds=model(batch_in_c)
-    preds_pos=torch.gather(preds,-1,batch_out_c)
-    preds_neg=torch.gather(preds,-1,batch_neg_c)
-    diff=preds_pos-preds_neg-torch.full_like(preds_pos,loss_margin)
-    loss=-(torch.sum(torch.min(diff*mask,torch.zeros_like(diff)))/non_zeros_in_batch)
+#    optimizer.zero_grad()
+#    preds=model(batch_in_c)
+#    preds_pos=torch.gather(preds,-1,batch_out_c)
+#    preds_neg=torch.gather(preds,-1,batch_neg_c)
+#    diff=preds_pos-preds_neg-torch.full_like(preds_pos,loss_margin)
+#    loss=-(torch.sum(torch.min(diff*mask,torch.zeros_like(diff)))/non_zeros_in_batch)
     
-    loss_value=loss.item()
-    del batch_in_c,batch_out_c,batch_neg_c,preds_pos,preds_neg,diff,loss,preds
-    return loss_value
+#    loss_value=loss.item()
+#    del batch_in_c,batch_out_c,batch_neg_c,preds_pos,preds_neg,diff,loss,preds
+#    return loss_value
     
     
 def train(args):
@@ -113,6 +150,8 @@ def train(args):
     idx2label,label2idx,class_stats=data.prep_class_stats(args.class_stats_file, args.max_labels)
     filtered_labels=set(k for k,v in class_stats.most_common(args.max_labels))
     all_label_indices = torch.tensor([ label2idx[l] for l in filtered_labels ]) # TODO zero class!
+    
+    gold_labels = read_gold_labels("data/devel.txt.gz")
 
     os.makedirs(args.store_cpoint,exist_ok=True)
     #Do we load from checkpoint?
@@ -132,30 +171,61 @@ def train(args):
         model=model.cuda()
         optimizer = optim.SGD(model.parameters(), lr=args.lrate, momentum=0.9)    
         it_counter=0
-        
-    dev_iter = data.yield_batched(args.dev,args.batch_elements,max_epochs=1000000000,all_class_indices=set(all_label_indices))
     model.train()
+    torch.set_grad_enabled(True)
+    
+    
+    
+    # TODO dev data
+    with open(args.dev, "rb") as f:
+        input_sequences, classidx_sequences=torch.load(f)
+        input_sequences = input_sequences[:1000]
+        classidx_sequences = classidx_sequences[:1000]
+    #dev_iter = data.yield_batched((input_sequences, classidx_sequences), args.batch_elements, shuffle=False, max_epochs=1, all_class_indices=set(all_label_indices))
+    
+    train_losses = []
     for batch_in,batch_out,batch_neg in tqdm.tqdm(data.yield_batched(args.train,args.batch_elements,max_epochs=100,all_class_indices=set(all_label_indices))):
         
-        train_loss = train_batch(model, batch_in, batch_out, batch_neg, optimizer)
-        print("IT",it_counter,"TRAIN_LOSS", train_loss, flush=True)
+        train_loss, _ = train_batch(model, batch_in, batch_out, batch_neg, optimizer)
+        train_losses.append(train_loss)
 
-        # if it_counter%50==0:
-        #     model.eval()
-        #     dev_data, dev_pos, dev_neg = next(dev_iter)
-        #     dev_loss = eval_batch(model, dev_data, dev_pos, dev_neg, optimizer)
-        #     print("DEV_LOSS",dev_loss,flush=True)
-        #     model.train()
+        if it_counter%args.report_every==0:
+            print("IT",it_counter,"TRAIN_LOSS", sum(train_losses)/len(train_losses), flush=True)
+            train_losses = []
+            # DEV
+            dev_losses = []
+            predictions = []
+            for dev_data, dev_pos, dev_neg in data.yield_batched((input_sequences, classidx_sequences), args.batch_elements, shuffle=False, max_epochs=1, all_class_indices=set(all_label_indices)):
+                dev_loss, predicted_labels = train_batch(model, dev_data, dev_pos, dev_neg, optimizer, evaluate=True)
+                predictions+=predicted_labels
+                dev_losses.append(dev_loss)
+            print("DEV_LOSS", sum(dev_losses)/len(dev_losses),flush=True)
+            calculate_fscore(gold_labels, predictions, idx2label, threshold=50)
+            
         
         if it_counter%10000==0:
             print("Saving model", it_counter, file=sys.stderr,flush=True)
             model.save(os.path.join(args.store_cpoint,"model_{:09}.torch".format(it_counter)),{"optimizer_state_dict":optimizer.state_dict(), "it_counter":it_counter})
         it_counter+=1
 
+
+def read_gold_labels(fname):
+
+    # read gold labels
+    gold_labels = []
+    import gzip
+    with gzip.open(fname, "rt", encoding="utf-8") as f:
+        for line in f:
+            gold_labels.append([])
+            line=line.strip()
+            classes, _ = line.split("\t", 1)
+            for c in classes.split(","):
+                gold_labels[-1].append(c)
+                
+    return gold_labels
         
 def predict(args):
     class_stats=json.load(open(args.class_stats_file)) #this is a dict: label -> count
-    alias=alias_multinomial.AliasMultinomial.from_class_stats(args.class_stats_file,args.max_labels)
 
     idx2label,label2idx,class_stats=data.prep_class_stats(args.class_stats_file, args.max_labels)
     filtered_labels=set(k for k,v in class_stats.most_common(args.max_labels))
@@ -182,72 +252,22 @@ def predict(args):
 
     losses=[]
     predicted_labels=[]
-    prediction_values=[]
-    for batch_in,batch_out,batch_neg in tqdm.tqdm(data.yield_batched(args.dev,args.batch_elements,max_epochs=1,alias=alias,shuffle=False)):
-        batch_in=batch_in.long()[:,:510]
-        batch_out=batch_out.long()[:,:510]
-        batch_neg=batch_neg.long()[:,:510]
-
-        non_zeros_in_batch = (batch_out!=0.0).sum()
-        
-        batch_mask = torch.zeros(batch_in.size()[0], len(idx2label))
-
-
-        batch_in_c=batch_in.cuda()
-        batch_out_c=batch_out.cuda()
-        batch_neg_c=batch_neg.cuda()
-
-        optimizer.zero_grad()
-        preds=model(batch_in_c)
-        
-        repeated = label_indices.repeat(preds.size()[0], 1)
-        
-        preds_filtered = torch.gather(preds, -1, repeated) # pick only labels used in training
-        
-        sorted_indices = torch.argsort(preds_filtered, descending=True)
-        
-        pred_values_sorted = torch.gather(preds_filtered, -1, sorted_indices) # prediction values sorted
-        classes_sorted = torch.gather(repeated, -1, sorted_indices) # class numbers sorted
-
-        for c_row, c_value in zip(classes_sorted, pred_values_sorted):
-            predicted_labels.append(c_row.tolist())
-            prediction_values.append(c_value.tolist())
-        
-        
- 
-        preds_pos=torch.gather(preds,-1,batch_out_c)
-        preds_neg=torch.gather(preds,-1,batch_neg_c)
-
-        diff=preds_pos-preds_neg
-        #loss=-torch.mean(torch.min(diff,torch.zeros_like(diff)))
-        loss=-(torch.sum(torch.min(diff,torch.zeros_like(diff)))/non_zeros_in_batch)
-        losses.append(loss.item())
-        #loss.backward()
-        #optimizer.step()
-        #print("batch",it_counter,"dev loss:", loss.item(),flush=True)
-
-        del batch_in_c, batch_out_c, batch_neg_c, preds_pos, preds_neg, diff, loss, preds, repeated, pred_values_sorted, classes_sorted, sorted_indices, preds_filtered
+    # prediction_values=[] # TODO return also these
+    for batch_in, batch_out, batch_neg in tqdm.tqdm(data.yield_batched(args.dev,args.batch_elements, max_epochs=1, alias=alias, shuffle=False)):
+    
+        loss, labels = train_batch(model, batch_in, batch_out, batch_neg, optimizer, evaluate=True)
+        losses.append(loss)
+        predicted_labels+=labels
         
         it_counter+=1
 
         if it_counter>=100:
             break
-        if len(predicted_labels)%1000==0:
-            print("Number of examples:", len(predicted_labels))
-        
-    # read gold labels
-    gold_labels = []
-    import gzip
-    with gzip.open("data/devel.txt.gz", "rt", encoding="utf-8") as f:
-        for line in f:
-            gold_labels.append([])
-            line=line.strip()
-            classes, _ = line.split("\t", 1)
-            for c in classes.split(","):
-                gold_labels[-1].append(c)
-            
+
     print("DEV LOSS:", (torch.tensor(losses).sum()/torch.tensor(len(losses))).item())
     
+    # read gold labels
+    gold_labels = read_gold_labels(args.dev)
     for t in [1, 10, 25, 50, 100, 200, 300, 400, 500, 0]:
     #for t in [1, 10]:
         print("threshold =", t)
@@ -294,7 +314,7 @@ def calculate_fscore(gold, pred, index2label, threshold=0):
     gold_ = binarizer.transform(gold[:len(pred_labels)])
     pred_ = binarizer.transform(pred_labels)
     
-    print("F-score:",precision_recall_fscore_support(gold_, pred_, average="micro"))
+    print("Pre/Rec/F-score:",precision_recall_fscore_support(gold_, pred_, average="micro"))
 
     
 if __name__=="__main__":
@@ -310,6 +330,7 @@ if __name__=="__main__":
     parser.add_argument("--lrate",type=float,default=1.0,help="Learning rate. Default %(default)f")
     parser.add_argument("--batch-elements",type=int,default=5000,help="How many elements in a batch? (sum of minibatch matrix sizes, not sequence count). Increase if you have more GPU mem. Default %(default)d")
     parser.add_argument("--predict", action="store_true", default=False, help="Run Prediction")
+    parser.add_argument("--report-every", type=int, default=100, help="Report train/devel loss after every X batches")
     args=parser.parse_args()
 
     with torch.cuda.device(args.gpu):

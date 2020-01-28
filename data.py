@@ -69,8 +69,11 @@ def prep_ctrl_data(inp,bert_tokenizer,bert_tokenizer_trie,class_stats_file,max_l
     return input_sequences, classidx_sequences
 
 def yield_batched(prepped_data_file,batchsize=10000,shuffle=True,max_epochs=1,all_class_indices=None):
-    with open(prepped_data_file,"rb") as f:
-        input_sequences, classidx_sequences=torch.load(f)
+    if isinstance(prepped_data_file, str):
+        with open(prepped_data_file,"rb") as f:
+            input_sequences, classidx_sequences=torch.load(f)
+    else:
+        input_sequences, classidx_sequences = prepped_data_file
     for epoch in range(max_epochs):
         if shuffle:
             idx_seq=list(range(len(input_sequences)))
