@@ -68,7 +68,7 @@ def prep_ctrl_data(inp,bert_tokenizer,bert_tokenizer_trie,class_stats_file,max_l
         input_sequences.append(torch.tensor(bert_tokenizer.convert_tokens_to_ids(seq_tok),dtype=torch.int32))
     return input_sequences, classidx_sequences
 
-def yield_batched(prepped_data_file,batchsize=10000,shuffle=True,max_epochs=1,alias=None):
+def yield_batched(prepped_data_file,batchsize=10000,shuffle=True,max_epochs=1,all_class_indices=None):
     with open(prepped_data_file,"rb") as f:
         input_sequences, classidx_sequences=torch.load(f)
     for epoch in range(max_epochs):
@@ -86,13 +86,10 @@ def yield_batched(prepped_data_file,batchsize=10000,shuffle=True,max_epochs=1,al
         negidx_lengths=[]
         for inp_seq, classidx_seq in zip(input_sequences,classidx_sequences):
             #make negatives?
-            if alias is not None:
-                classidx_set=set(classidx_seq)
-                negs_set=set(alias.draw(len(classidx_set)*3))
-                negs_set-=classidx_set
+            if all_class_indices is not None:
+                classidx_set=set(classidx_seq) #positives
+                negs_set=all_class_indices-classidx_set #negatives
                 negs=list(negs_set)
-                random.shuffle(negs)
-                negs=negs[:len(classidx_set)]
                 negidx_seq=torch.tensor(negs,dtype=inp_seq.dtype)
             else:
                 negidx_seq=torch.tensor([],dtype=inp_seq.dtype)

@@ -56,23 +56,25 @@ def do_train(args):
 def train_batch(model, data, positives, negatives, optimizer,loss_margin=0.3):
     torch.set_grad_enabled(True)
     data=data.long()[:,:510]
-    positives=positives.long()[:,:510]
-    negatives=negatives.long()[:,:510]
+    positives=positives.long()
+    negatives=negatives.long()
     
 
     batch_in_c=data.cuda()
     batch_out_c=positives.cuda()
     batch_neg_c=negatives.cuda()
 
-    mask=(batch_out_c!=0).type(torch.float)
-    non_zeros_in_batch = (mask).sum()
-
     optimizer.zero_grad()
     preds=model(batch_in_c)
     preds_pos=torch.gather(preds,-1,batch_out_c)
     preds_neg=torch.gather(preds,-1,batch_neg_c)
-    diff=preds_pos-preds_neg-torch.full_like(preds_pos,loss_margin)
-    loss=-(torch.sum(torch.min(diff*mask,torch.zeros_like(diff)))/non_zeros_in_batch)
+
+    diff=pred_pos.unsqueeze(-1).repeat(1,1,preds_neg.shape[1])-preds_neg.unsqueeze(1)-loss_margin
+    X_mask=(batch_out_c!=0).float().unsqueeze(-1).repeat(1,1,preds_neg.shape[1])
+    Y_mask=(batch_neg_c!=0).float().unsqueeze(1).repeat(1,preds_pos.shape[1],1)
+    #diff=preds_pos-preds_neg-torch.full_like(preds_pos,loss_margin)
+    mask=X_mask*Y_mask
+    loss=-(torch.sum(torch.min(diff*X_mask*Y_mask,torch.zeros_like(diff)))/mask.sum())
     loss.backward()
     optimizer.step()
     loss_value=loss.item()
@@ -107,8 +109,10 @@ def eval_batch(model, data, positives, negatives, optimizer,loss_margin=0.3):
     
     
 def train(args):
-    class_stats=json.load(open(args.class_stats_file)) #this is a dict: label -> count
-    alias=alias_multinomial.AliasMultinomial.from_class_stats(args.class_stats_file,args.max_labels)
+    #class_stats=json.load(open(args.class_stats_file)) #this is a dict: label -> count
+    idx2label,label2idx,class_stats=data.prep_class_stats(args.class_stats_file, args.max_labels)
+    filtered_labels=set(k for k,v in class_stats.most_common(args.max_labels))
+    all_label_indices = torch.tensor([ label2idx[l] for l in filtered_labels ]) # TODO zero class!
 
     os.makedirs(args.store_cpoint,exist_ok=True)
     #Do we load from checkpoint?
@@ -129,72 +133,25 @@ def train(args):
         optimizer = optim.SGD(model.parameters(), lr=args.lrate, momentum=0.9)    
         it_counter=0
         
-    dev_iter = data.yield_batched(args.dev,args.batch_elements,max_epochs=1000000000,alias=alias)
+    dev_iter = data.yield_batched(args.dev,args.batch_elements,max_epochs=1000000000,all_class_indices=set(all_label_indices))
     model.train()
-    for batch_in,batch_out,batch_neg in tqdm.tqdm(data.yield_batched(args.train,args.batch_elements,max_epochs=100,alias=alias)):
+    for batch_in,batch_out,batch_neg in tqdm.tqdm(data.yield_batched(args.train,args.batch_elements,max_epochs=100,all_class_indices=set(all_label_indices))):
         
         train_loss = train_batch(model, batch_in, batch_out, batch_neg, optimizer)
         print("IT",it_counter,"TRAIN_LOSS", train_loss, flush=True)
 
-        if it_counter%50==0:
-            model.eval()
-            dev_data, dev_pos, dev_neg = next(dev_iter)
-            dev_loss = eval_batch(model, dev_data, dev_pos, dev_neg, optimizer)
-            print("DEV_LOSS",dev_loss,flush=True)
-            model.train()
+        # if it_counter%50==0:
+        #     model.eval()
+        #     dev_data, dev_pos, dev_neg = next(dev_iter)
+        #     dev_loss = eval_batch(model, dev_data, dev_pos, dev_neg, optimizer)
+        #     print("DEV_LOSS",dev_loss,flush=True)
+        #     model.train()
         
         if it_counter%10000==0:
             print("Saving model", it_counter, file=sys.stderr,flush=True)
             model.save(os.path.join(args.store_cpoint,"model_{:09}.torch".format(it_counter)),{"optimizer_state_dict":optimizer.state_dict(), "it_counter":it_counter})
         it_counter+=1
 
-def do_train_simple(args):
-    class_stats=json.load(open(args.class_stats_file)) #this is a dict: label -> count
-    alias=alias_multinomial.AliasMultinomial.from_class_stats(args.class_stats_file,args.max_labels)
-
-
-    #Do we load from checkpoint?
-    if args.from_cpoint:
-        model,d=tml.MlabelSimple.from_cpoint(args.from_cpoint)
-        model=model.cuda()
-        optimizer = optim.SGD(model.parameters(), lr=args.lrate, momentum=0.9)
-        if d.get("optimizer_state_dict"):
-            optimizer.load_state_dict(d["optimizer_state_dict"])
-        it_counter=d.get("it_counter",0)
-    else:
-        #start from fresh
-        os.makedirs(args.store_cpoint,exist_ok=True)
-        encoder_model = transformers.BertModel.from_pretrained("pbert-v1",output_hidden_states=False)
-        encoder_model = encoder_model.cuda()
-        model=tml.MlabelSimple(encoder_model,len(class_stats))
-        model=model.cuda()
-        optimizer = optim.SGD(model.parameters(), lr=args.lrate, momentum=0.9)    
-        it_counter=0
-
-    for batch_in,batch_out,batch_neg in tqdm.tqdm(data.yield_batched(args.train,args.batch_elements,max_epochs=100,alias=alias)):
-        batch_in=batch_in.long()[:,:510]
-        batch_out=batch_out.long()[:,:510]
-        batch_neg=batch_neg.long()[:,:510]
-
-        batch_in_c=batch_in.cuda()
-        batch_out_c=batch_out.cuda()
-        batch_neg_c=batch_neg.cuda()
-
-        optimizer.zero_grad()
-        preds=model(batch_in_c)
-        preds_pos=torch.gather(preds,-1,batch_out_c)
-        preds_neg=torch.gather(preds,-1,batch_neg_c)
-        diff=preds_pos-preds_neg
-        loss=-torch.mean(torch.min(diff,torch.zeros_like(diff)))
-        loss.backward()
-        optimizer.step()
-        print("loss",loss.item(),flush=True)
-
-        del batch_in_c,batch_out_c,batch_neg_c,preds_pos,preds_neg,diff,loss,preds
-        
-        if it_counter%500==0:
-            model.save(os.path.join(args.store_cpoint,"model_{:09}.torch".format(it_counter)),{"optimizer_state_dict":optimizer.state_dict(), "it_counter":it_counter})
-        it_counter+=1
         
 def predict(args):
     class_stats=json.load(open(args.class_stats_file)) #this is a dict: label -> count
