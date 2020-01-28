@@ -26,7 +26,7 @@ class AliasMultinomial(torch.nn.Module):
     '''
 
     @classmethod
-    def from_class_stats(cls,class_stats_filename,max_labels):
+    def from_class_stats(cls,class_stats_filename,max_labels,flat=False):
         """
         'stats': a dict of label -> count
         'filtered'
@@ -34,7 +34,10 @@ class AliasMultinomial(torch.nn.Module):
         idx2label,label2idx,class_stats=data.prep_class_stats(class_stats_filename,max_labels)
         probs=torch.zeros((len(class_stats),),dtype=torch.float)
         for label,count in class_stats.most_common(max_labels):
-            probs[label2idx[label]]=count
+            if not flat:
+                probs[label2idx[label]]=count
+            else:
+                probs[label2idx[label]]=1
         probs/=torch.sum(probs) #probs
         return cls(probs)
         

@@ -23,7 +23,7 @@ transformers.tokenization_bert.PRETRAINED_POSITIONAL_EMBEDDINGS_SIZES["pbert-v1"
 transformers.tokenization_bert.PRETRAINED_INIT_CONFIGURATION["pbert-v1"]={'do_lower_case': False}
 
 def do_train(args):
-    alias=alias_multinomial.AliasMultinomial.from_class_stats(args.class_stats_file,args.max_labels)
+    alias=alias_multinomial.AliasMultinomial.from_class_stats(args.class_stats_file,args.max_labels,flat=True)
     
     encoder_model = transformers.BertModel.from_pretrained("pbert-v1",output_hidden_states=True)
     if torch.cuda.is_available():
@@ -53,53 +53,53 @@ def do_train(args):
         del batch_in_c,batch_out_c,batch_neg_c,encoder_output,decoder_output_pos,decoder_output_neg,encoder_attention_mask
 
 
-def train_batch(model, data, positives, negatives, optimizer):
-
+def train_batch(model, data, positives, negatives, optimizer,loss_margin=0.3):
+    torch.set_grad_enabled(True)
     data=data.long()[:,:510]
     positives=positives.long()[:,:510]
     negatives=negatives.long()[:,:510]
     
-    non_zeros_in_batch = (positives!=0.0).sum()
 
     batch_in_c=data.cuda()
     batch_out_c=positives.cuda()
     batch_neg_c=negatives.cuda()
 
-    model.train()
-    torch.set_grad_enabled(True)
+    mask=(batch_out_c!=0).type(torch.float)
+    non_zeros_in_batch = (mask).sum()
+
     optimizer.zero_grad()
     preds=model(batch_in_c)
     preds_pos=torch.gather(preds,-1,batch_out_c)
     preds_neg=torch.gather(preds,-1,batch_neg_c)
-    diff=preds_pos-preds_neg
-    loss=-(torch.sum(torch.min(diff,torch.zeros_like(diff)))/non_zeros_in_batch)
+    diff=preds_pos-preds_neg-torch.full_like(preds_pos,loss_margin)
+    loss=-(torch.sum(torch.min(diff*mask,torch.zeros_like(diff)))/non_zeros_in_batch)
     loss.backward()
     optimizer.step()
     loss_value=loss.item()
-    del batch_in_c,batch_out_c,batch_neg_c,preds_pos,preds_neg,diff,loss,preds
     return loss_value
     
     
-def eval_batch(model, data, positives, negatives, optimizer):
+def eval_batch(model, data, positives, negatives, optimizer,loss_margin=0.3):
+    torch.set_grad_enabled(False)
 
     data=data.long()[:,:510]
     positives=positives.long()[:,:510]
     negatives=negatives.long()[:,:510]
     
-    non_zeros_in_batch = (positives!=0.0).sum()
-
     batch_in_c=data.cuda()
     batch_out_c=positives.cuda()
     batch_neg_c=negatives.cuda()
+    mask=(batch_out_c!=0).type(torch.float)
+    non_zeros_in_batch = (mask).sum()
 
-    model.eval()
-    torch.set_grad_enabled(False)
+
+
     optimizer.zero_grad()
     preds=model(batch_in_c)
     preds_pos=torch.gather(preds,-1,batch_out_c)
     preds_neg=torch.gather(preds,-1,batch_neg_c)
-    diff=preds_pos-preds_neg
-    loss=-(torch.sum(torch.min(diff,torch.zeros_like(diff)))/non_zeros_in_batch)
+    diff=preds_pos-preds_neg-torch.full_like(preds_pos,loss_margin)
+    loss=-(torch.sum(torch.min(diff*mask,torch.zeros_like(diff)))/non_zeros_in_batch)
     
     loss_value=loss.item()
     del batch_in_c,batch_out_c,batch_neg_c,preds_pos,preds_neg,diff,loss,preds
@@ -130,16 +130,18 @@ def train(args):
         it_counter=0
         
     dev_iter = data.yield_batched(args.dev,args.batch_elements,max_epochs=1000000000,alias=alias)
-
+    model.train()
     for batch_in,batch_out,batch_neg in tqdm.tqdm(data.yield_batched(args.train,args.batch_elements,max_epochs=100,alias=alias)):
         
         train_loss = train_batch(model, batch_in, batch_out, batch_neg, optimizer)
         print("IT",it_counter,"TRAIN_LOSS", train_loss, flush=True)
 
         if it_counter%50==0:
+            model.eval()
             dev_data, dev_pos, dev_neg = next(dev_iter)
             dev_loss = eval_batch(model, dev_data, dev_pos, dev_neg, optimizer)
             print("DEV_LOSS",dev_loss,flush=True)
+            model.train()
         
         if it_counter%10000==0:
             print("Saving model", it_counter, file=sys.stderr,flush=True)
