@@ -44,9 +44,12 @@ class MlabelSimple(nn.Module):
         self.encoder=bert
         self.classifier=nn.Linear(self.encoder.config.hidden_size,label_count)
 
-    def forward(self,encoder_input):
+    def forward(self,encoder_input,sigm=True):
         last_hidden,cls=self.encoder(encoder_input)
-        return torch.sigmoid(self.classifier(cls))
+        if sigm:
+            return torch.sigmoid(self.classifier(cls))
+        else:
+            return self.classifier(cls)
         #classification_output=self.classifier(bert_encoded
 
     def save(self,f_name,xtra_dict={}):

@@ -52,8 +52,6 @@ def do_train(args):
 
         del batch_in_c,batch_out_c,batch_neg_c,encoder_output,decoder_output_pos,decoder_output_neg,encoder_attention_mask
 
-
-
 def get_predictions(preds, all_labels):
 
     predicted_labels=[]
@@ -65,7 +63,7 @@ def get_predictions(preds, all_labels):
         
     preds_filtered = torch.gather(preds, -1, repeated) # pick only labels used in training
         
-    sorted_indices = torch.argsort(preds_filtered, descending=True)
+    sorted_indices = torch.argsort(preds_filtered, -1, True)
         
     pred_values_sorted = torch.gather(preds_filtered, -1, sorted_indices) # prediction values sorted
     classes_sorted = torch.gather(repeated, -1, sorted_indices) # class numbers sorted
@@ -77,7 +75,8 @@ def get_predictions(preds, all_labels):
     return predicted_labels, prediction_values
 
 
-def train_batch(model, data, positives, negatives, optimizer, loss_margin=0.3, evaluate=False):
+lossF=torch.nn.BCEWithLogitsLoss()
+def train_batch_onehot(model, data, positives, negatives, optimizer, loss_margin=0.3, evaluate=False):
     if evaluate:
         model.eval()
         torch.set_grad_enabled(False)
@@ -91,59 +90,31 @@ def train_batch(model, data, positives, negatives, optimizer, loss_margin=0.3, e
 
     batch_in_c=data.cuda()
     batch_out_c=positives.cuda()
-    batch_neg_c=negatives.cuda()
+    batch_out_c_one_hot=torch.zeros((batch_in_c.shape[0],model.label_count)).cuda()
+    batch_out_c_one_hot.scatter_(1,batch_out_c,torch.ones_like(batch_out_c_one_hot))
+    batch_out_c_one_hot[:,0]=0 #undo mask
+    del batch_out_c
+    
+
 
     optimizer.zero_grad()
-    preds=model(batch_in_c)
-    preds_pos=torch.gather(preds,-1,batch_out_c)
-    preds_neg=torch.gather(preds,-1,batch_neg_c)
-
-    diff=preds_pos.unsqueeze(-1).repeat(1,1,preds_neg.shape[1])-preds_neg.unsqueeze(1)-loss_margin
-    X_mask=(batch_out_c!=0).float().unsqueeze(-1).repeat(1,1,preds_neg.shape[1])
-    Y_mask=(batch_neg_c!=0).float().unsqueeze(1).repeat(1,preds_pos.shape[1],1)
-    #diff=preds_pos-preds_neg-torch.full_like(preds_pos,loss_margin)
-    mask=X_mask*Y_mask
-    loss=-(torch.sum(torch.min(diff*X_mask*Y_mask,torch.zeros_like(diff)))/mask.sum())
+    preds=model(batch_in_c,sigm=False)
+    loss=lossF(preds,batch_out_c_one_hot)
     if evaluate:
         # calculate fscore
-        all_labels = set(positives[0].tolist()) | set(negatives[0].tolist()) - set([0])
-        predicted_labels, prediction_values = get_predictions(preds, all_labels)
+        #all_labels = set(positives[0].tolist()) | set(negatives[0].tolist()) - set([0])
+        gold=[set(pos_labs.tolist())-{0} for pos_labs in positives]
+        prf_scores=f_score_batch(torch.sigmoid(preds),gold,cutoffs=torch.arange(0,1,0.1)) #dict keyed by cutoff
         model.train()
         torch.set_grad_enabled(True) # pre-set this for the next loop
     else:
         loss.backward()
         optimizer.step()
-        predicted_labels=None
+        prf_scores=None
     loss_value=loss.item()
-    return loss_value, predicted_labels
-    
-    
-#def eval_batch(model, data, positives, negatives, optimizer,loss_margin=0.3):
-#    torch.set_grad_enabled(False)
-
-#    data=data.long()[:,:510]
-#    positives=positives.long()[:,:510]
-#    negatives=negatives.long()[:,:510]
-    
-#    batch_in_c=data.cuda()
-#    batch_out_c=positives.cuda()
-#    batch_neg_c=negatives.cuda()
-#    mask=(batch_out_c!=0).type(torch.float)
-#    non_zeros_in_batch = (mask).sum()
+    return loss_value, prf_scores
 
 
-
-#    optimizer.zero_grad()
-#    preds=model(batch_in_c)
-#    preds_pos=torch.gather(preds,-1,batch_out_c)
-#    preds_neg=torch.gather(preds,-1,batch_neg_c)
-#    diff=preds_pos-preds_neg-torch.full_like(preds_pos,loss_margin)
-#    loss=-(torch.sum(torch.min(diff*mask,torch.zeros_like(diff)))/non_zeros_in_batch)
-    
-#    loss_value=loss.item()
-#    del batch_in_c,batch_out_c,batch_neg_c,preds_pos,preds_neg,diff,loss,preds
-#    return loss_value
-    
     
 def train(args):
     #class_stats=json.load(open(args.class_stats_file)) #this is a dict: label -> count
@@ -151,7 +122,7 @@ def train(args):
     filtered_labels=set(k for k,v in class_stats.most_common(args.max_labels))
     all_label_indices = torch.tensor([ label2idx[l] for l in filtered_labels ]) # TODO zero class!
     
-    gold_labels = read_gold_labels("data/devel.txt.gz")
+    gold_labels = read_gold_labels(os.path.dirname(args.dev)+"/devel.txt.gz")
 
     os.makedirs(args.store_cpoint,exist_ok=True)
     #Do we load from checkpoint?
@@ -186,27 +157,76 @@ def train(args):
     train_losses = []
     for batch_in,batch_out,batch_neg in tqdm.tqdm(data.yield_batched(args.train,args.batch_elements,max_epochs=100,all_class_indices=set(all_label_indices))):
         
-        train_loss, _ = train_batch(model, batch_in, batch_out, batch_neg, optimizer)
+        train_loss, _ = train_batch_onehot(model, batch_in, batch_out, batch_neg, optimizer)
         train_losses.append(train_loss)
 
         if it_counter%args.report_every==0:
             print("IT",it_counter,"TRAIN_LOSS", sum(train_losses)/len(train_losses), flush=True)
             train_losses = []
+            
             # DEV
             dev_losses = []
-            predictions = []
+            prf_scores = []
             for dev_data, dev_pos, dev_neg in data.yield_batched((input_sequences, classidx_sequences), args.batch_elements, shuffle=False, max_epochs=1, all_class_indices=set(all_label_indices)):
-                dev_loss, predicted_labels = train_batch(model, dev_data, dev_pos, dev_neg, optimizer, evaluate=True)
-                predictions+=predicted_labels
+                dev_loss, prf_scores_batch = train_batch_onehot(model, dev_data, dev_pos, dev_neg, optimizer, evaluate=True)
+                prf_scores.append(prf_scores_batch)
                 dev_losses.append(dev_loss)
             print("DEV_LOSS", sum(dev_losses)/len(dev_losses),flush=True)
-            calculate_fscore(gold_labels, predictions, idx2label, threshold=50)
-            
+            F,P,R,cutoff=max_prf(prf_scores)
+            print("F/P/R/cutoff", F,P,R,cutoff,flush=True)
         
         if it_counter%10000==0:
             print("Saving model", it_counter, file=sys.stderr,flush=True)
             model.save(os.path.join(args.store_cpoint,"model_{:09}.torch".format(it_counter)),{"optimizer_state_dict":optimizer.state_dict(), "it_counter":it_counter})
         it_counter+=1
+
+def max_prf(list_of_batch_scores):
+    all_batch_scores={}
+    for batch_scores in list_of_batch_scores:
+        #this is a dict with a list of (p,r,f) for each cutoff
+        for cutoff, list_of_prf in batch_scores.items():
+            all_batch_scores.setdefault(cutoff,[]).extend(list_of_prf)
+    #now all_batch_scores is mostly done
+    final=[] #will be a list of (f,p,r,cutoff) which we then sort on f
+    for cutoff,list_of_prf in all_batch_scores.items():
+        P,R,F=0,0,0
+        for p,r,f in list_of_prf:
+            P+=p
+            R+=r
+            F+=f
+        P/=len(list_of_prf)
+        R/=len(list_of_prf)
+        F/=len(list_of_prf)
+        final.append((F,P,R,cutoff))
+    final.sort(reverse=True)
+    return final[0] #returns maximal F,P,R,cutoff
+
+def f_score_batch(predictions,gold,cutoffs):
+    result={} #key cutoff, value list of (p,r,f)
+    sorted_predictions,sorted_indices=torch.sort(predictions,-1,True)
+    for threshold in cutoffs:
+        positive_predictions=sorted_predictions>=threshold
+        predicted=sorted_indices*positive_predictions
+        for p,g in zip(predicted,gold):
+            #print("THRESHOLD",threshold.item(),flush=True)
+            #print("PREDICTIONS SHAPE",predictions.shape,flush=True)
+            #print("GOLD","len:",len(g),"data:",g,flush=True)
+            predicted_classes=set(p.tolist())-{0}
+            #print("PRED","len:",len(predicted_classes),"data:",flush=True)
+            true_pos=predicted_classes&g
+            #print("TP","len:",len(true_pos),"data:",true_pos,"\n\n\n\n",flush=True)
+            if len(predicted_classes)>0:
+                prec=len(true_pos)/len(predicted_classes)
+            else:
+                prec=0
+            rec=len(true_pos)/len(g)
+            if prec+rec!=0:
+                f1=2*prec*rec/(prec+rec)
+            else:
+                f1=0.0
+            result.setdefault(threshold.item(),[]).append((prec,rec,f1))
+    return result
+
 
 
 def read_gold_labels(fname):
@@ -224,97 +244,31 @@ def read_gold_labels(fname):
                 
     return gold_labels
         
-def predict(args):
-    class_stats=json.load(open(args.class_stats_file)) #this is a dict: label -> count
 
-    idx2label,label2idx,class_stats=data.prep_class_stats(args.class_stats_file, args.max_labels)
-    filtered_labels=set(k for k,v in class_stats.most_common(args.max_labels))
-    label_indices = torch.tensor([ label2idx[l] for l in filtered_labels ]).cuda() # TODO zero class!
-    
-    print("filtered labels:", type(label_indices), label_indices.size())
+# def calculate_fscore(gold, pred, index2label, threshold=0):
 
-
-    #Do we load from checkpoint?
-    if not args.from_cpoint:
-        print("Provide a checkpoint!", file=sys.stderr)
-        sys.exit(0)
-    model,d=tml.MlabelSimple.from_cpoint(args.from_cpoint)
-    model.eval()
-    model=model.cuda()
-    optimizer = optim.SGD(model.parameters(), lr=args.lrate, momentum=0.9) # TODO: do we need this?
-    if d.get("optimizer_state_dict"):
-        optimizer.load_state_dict(d["optimizer_state_dict"])
-    torch.set_grad_enabled(False)
-                
-        
-    it_counter = 0
-
-
-    losses=[]
-    predicted_labels=[]
-    # prediction_values=[] # TODO return also these
-    for batch_in, batch_out, batch_neg in tqdm.tqdm(data.yield_batched(args.dev,args.batch_elements, max_epochs=1, shuffle=False, all_class_indices=set(label_indices))):
-    
-        loss, labels = train_batch(model, batch_in, batch_out, batch_neg, optimizer, evaluate=True)
-        losses.append(loss)
-        predicted_labels+=labels
-        
-        it_counter+=1
-
-        if it_counter>=100:
-            break
-
-    print("DEV LOSS:", (torch.tensor(losses).sum()/torch.tensor(len(losses))).item())
-    
-    # read gold labels
-    gold_labels = read_gold_labels(args.dev.split(".", 1)[0]+".txt.gz")
-    for t in [1, 10, 25, 50, 100, 200, 300, 400, 500, 0]:
-    #for t in [1, 10]:
-        print("threshold =", t)
-        calculate_fscore(gold_labels, predicted_labels, idx2label, threshold=t)
-        print()
-        
-        
-    # print top labels for first five example
-    
-    #for i,labels in enumerate(predicted_labels[:5]):
-    #    for l in labels[:20]:
-    #        per = round((class_stats[idx2label[l]]/sum(class_stats.values()))*100, 4)
-    #        print("example",i, "label",idx2label[l],per,"%")
-    #    print("---------")
-        
-    #for i,labels in enumerate(gold_labels[:5]):
-    #    for l in labels[:20]:
-    #        per = round((class_stats[l]/sum(class_stats.values()))*100, 4)
-    #        print("gold example",i, "label",l,per,"%")
-    #    print("---------")
-
-
-
-def calculate_fscore(gold, pred, index2label, threshold=0):
-
-    from sklearn.metrics import f1_score, precision_recall_fscore_support
-    from sklearn.preprocessing import MultiLabelBinarizer
+#     from sklearn.metrics import f1_score, precision_recall_fscore_support
+#     from sklearn.preprocessing import MultiLabelBinarizer
     
 
-    pred_labels = []
-    for example in pred:
-        if threshold!=0:
-            example = example[:min(threshold,len(example))]
-        example_ = []
-        for l in example:
-            example_.append(index2label[l])
-        pred_labels.append(example_)
+#     pred_labels = []
+#     for example in pred:
+#         if threshold!=0:
+#             example = example[:min(threshold,len(example))]
+#         example_ = []
+#         for l in example:
+#             example_.append(index2label[l])
+#         pred_labels.append(example_)
     
     
-    all_labels = list(set([l for row in gold for l in row]) | set([l for row in pred_labels for l in row]))
-    binarizer = MultiLabelBinarizer()
-    binarizer.fit([all_labels])
+#     all_labels = list(set([l for row in gold for l in row]) | set([l for row in pred_labels for l in row]))
+#     binarizer = MultiLabelBinarizer()
+#     binarizer.fit([all_labels])
     
-    gold_ = binarizer.transform(gold[:len(pred_labels)])
-    pred_ = binarizer.transform(pred_labels)
+#     gold_ = binarizer.transform(gold[:len(pred_labels)])
+#     pred_ = binarizer.transform(pred_labels)
     
-    print("Pre/Rec/F-score:",precision_recall_fscore_support(gold_, pred_, average="micro"))
+#     print("Pre/Rec/F-score:",precision_recall_fscore_support(gold_, pred_, average="micro"))
 
     
 if __name__=="__main__":
